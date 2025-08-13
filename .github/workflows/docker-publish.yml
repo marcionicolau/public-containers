@@ -1,0 +1,132 @@
+name: Publish Docker Containers
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "containers/**/Dockerfile"
+      - ".github/workflows/docker-publish.yml"
+  workflow_dispatch:
+    inputs:
+      container_path:
+        description: "Path to container directory (e.g., containers/development/example)"
+        required: false
+        default: ""
+
+# Set the access for individual packages to the repository that triggered the workflow
+permissions:
+  contents: read
+  packages: write
+  # Optional: Allow the job to create and update pull requests
+  pull-requests: write
+
+jobs:
+  build-and-push:
+    name: Build and Push Container
+    runs-on: ubuntu-latest
+    # Skip workflow runs for paths that don't contain Dockerfiles
+    if: |
+      !contains(github.event.inputs.container_path, '..') && 
+      (github.event.inputs.container_path == '' || 
+       contains(github.event.inputs.container_path, 'containers/'))
+
+    strategy:
+      matrix:
+        # This will be populated dynamically in the "Get changed containers" step
+        container: [default]
+      fail-fast: false
+      max-parallel: 3 # Limit concurrent builds to avoid rate limiting
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/${{ github.repository }}/${{ matrix.container }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha,format=long,prefix=sha-
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.container }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # This job will dynamically determine which containers need to be built
+  get-changed-containers:
+    name: Find changed containers
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Needed to get git diff
+
+      - name: Find changed containers
+        id: changed-files
+        uses: tj-actions/changed-files@v44
+        with:
+          files: |
+            containers/**/Dockerfile
+            containers/**/docker-compose.yml
+
+      - name: Set up matrix
+        id: set-matrix
+        run: |
+          # If workflow_dispatch with specific container, use that
+          if [[ -n "${{ github.event.inputs.container_path }}" ]]; then
+            echo "matrix={\"container\":[\"${{ github.event.inputs.container_path }}\"]}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Otherwise, find all changed Dockerfiles
+          CHANGED_FILES="${{ steps.changed-files.outputs.all_changed_files }}"
+          if [[ -z "$CHANGED_FILES" ]]; then
+            # If no changes to Dockerfiles, build all containers
+            CONTAINERS=$(find containers -name Dockerfile | xargs -n1 dirname | jq -R -s -c 'split("\n")[:-1]')
+            echo "matrix={\"container\":$CONTAINERS}" >> $GITHUB_OUTPUT
+          else
+            # Build only changed containers
+            echo "$CHANGED_FILES" | jq -R 'split("\n")[:-1] | map(sub("/Dockerfile$"; "")) | unique | {container: .}' | \
+              jq -c 'if .container | length > 0 then . else {container: []} end' >> $GITHUB_OUTPUT
+          fi
+
+  # This job will run after all containers are built and pushed
+  notify:
+    name: Notify
+    needs: [build-and-push, get-changed-containers]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if any containers were built
+        if: needs.get-changed-containers.outputs.matrix == '{"container":[]}'
+        run: echo "No containers needed to be built."
+
+      - name: Show built containers
+        if: needs.get-changed-containers.outputs.matrix != '{"container":[]}'
+        run: |
+          echo "The following containers were built and pushed:"
+          echo "${{ needs.get-changed-containers.outputs.matrix }}" | jq -r '.container[]'
